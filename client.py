@@ -37,19 +37,51 @@ class MCPClient:
         )
         # --- 修改結束 ---
 
-    async def connect_to_server(self, server_script_path: str):
-        """連接到 MCP 伺服器"""
-        is_python = server_script_path.endswith('.py')
-        is_js = server_script_path.endswith('.js')
-        if not (is_python or is_js):
-            raise ValueError("伺服器腳本必須是 .py 或 .js 文件")
+    async def load_server_config(self):
+        self.server_config = {
+                "mcpServers": {
+                    "github": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-github"],
+                        "env": {
+                            "GITHUB_PERSONAL_ACCESS_TOKEN": os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
+                        }
+                    }
+                }
+            }
 
-        command = "python" if is_python else "node"
+    async def connect_to_server(self, server_name: str = "github"):
+        """連接到 MCP 伺服器"""
+        if not self.server_config:
+            await self.load_server_config()
+
+        server_info = self.server_config.get("mcpServers", {}).get(server_name)
+        if not server_info:
+            raise ValueError(f"No configuration found for server: {server_name}")
+
+        command = server_info.get("command")
+        args = server_info.get("args", [])
+        env = server_info.get("env", None)
+
         server_params = StdioServerParameters(
             command=command,
-            args=[server_script_path],
-            env=None
+            args=args,
+            env=env
         )
+
+        ########### 本地MCP server ###########
+        # is_python = server_script_path.endswith('.py')
+        # is_js = server_script_path.endswith('.js')
+        # if not (is_python or is_js):
+        #     raise ValueError("伺服器腳本必須是 .py 或 .js 文件")
+
+        # command = "python" if is_python else "node"
+        # server_params = StdioServerParameters(
+        #     command=command,
+        #     args=[server_script_path],
+        #     env=None
+        # )
+        ########### 本地MCP server ###########
 
         stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
         self.stdio, self.write = stdio_transport
@@ -155,16 +187,26 @@ class MCPClient:
         await self.exit_stack.aclose()
 
 async def main():
-    if len(sys.argv) < 2:
-        print("用法: python client.py <path_to_server_script>")
-        sys.exit(1)
 
     client = MCPClient()
     try:
-        await client.connect_to_server(sys.argv[1])
+        # Load configuration and connect to GitHub MCP server
+        await client.load_server_config()
+        await client.connect_to_server("github")
         await client.chat_loop()
     finally:
         await client.cleanup()
+    ########### 本地MCP server ###########
+    # if len(sys.argv) < 2:
+    #     print("用法: python client.py <path_to_server_script>")
+    #     sys.exit(1)
 
+    # client = MCPClient()
+    # try:
+    #     await client.connect_to_server(sys.argv[1])
+    #     await client.chat_loop()
+    # finally:
+    #     await client.cleanup()
+    ########### 本地MCP server ###########
 if __name__ == "__main__":
     asyncio.run(main())
