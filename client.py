@@ -1,33 +1,48 @@
 import asyncio
+import os
+import sys
+import json
 from typing import Optional
 from contextlib import AsyncExitStack
 
+# 安裝必要的套件:
+# pip install mcp-client openai python-dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from anthropic import Anthropic
+# 改為從 openai 庫導入 AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI
 from dotenv import load_dotenv
 
-load_dotenv()  # load environment variables from .env
+# 從 .env 文件載入環境變數
+load_dotenv()
 
 class MCPClient:
     def __init__(self):
-        # Initialize session and client objects
+        # 初始化 session 和 client 物件
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
-        self.anthropic = Anthropic()
-    # methods will go here
+
+        # --- 修改開始: 初始化 Azure OpenAI Client ---
+        # 從環境變數讀取 Azure OpenAI 的設定
+        self.azure_deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+        if not self.azure_deployment_name:
+            raise ValueError("AZURE_OPENAI_DEPLOYMENT_NAME 環境變數未設定")
+
+        # 使用非同步的 Azure OpenAI Client
+        self.openai_client = AsyncAzureOpenAI(
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_version=os.getenv("OPENAI_API_VERSION"),
+        )
+        # --- 修改結束 ---
 
     async def connect_to_server(self, server_script_path: str):
-        """Connect to an MCP server
-
-        Args:
-            server_script_path: Path to the server script (.py or .js)
-        """
+        """連接到 MCP 伺服器"""
         is_python = server_script_path.endswith('.py')
         is_js = server_script_path.endswith('.js')
         if not (is_python or is_js):
-            raise ValueError("Server script must be a .py or .js file")
+            raise ValueError("伺服器腳本必須是 .py 或 .js 文件")
 
         command = "python" if is_python else "node"
         server_params = StdioServerParameters(
@@ -42,104 +57,106 @@ class MCPClient:
 
         await self.session.initialize()
 
-        # List available tools
         response = await self.session.list_tools()
         tools = response.tools
-        print("\nConnected to server with tools:", [tool.name for tool in tools])
+        print("\n已連接到伺服器，可用工具:", [tool.name for tool in tools])
 
     async def process_query(self, query: str) -> str:
-        """Process a query using Claude and available tools"""
+        """使用 Azure OpenAI 和可用工具來處理查詢"""
         messages = [
-            {
-                "role": "user",
-                "content": query
-            }
+            {"role": "user", "content": query}
         ]
 
+        # 取得 MCP Server 提供的工具列表
         response = await self.session.list_tools()
+        # 轉換為 OpenAI API 接受的格式
         available_tools = [{
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": tool.inputSchema
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.inputSchema
+            }
         } for tool in response.tools]
 
-        # Initial Claude API call
-        response = self.anthropic.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=1000,
-            messages=messages,
-            tools=available_tools
-        )
+        # --- 修改開始: 使用 Azure OpenAI API 進行 Tool-Calling ---
+        while True:
+            # 第一次 (或後續) API 呼叫
+            print("...正在呼叫 Azure OpenAI...")
+            response = await self.openai_client.chat.completions.create(
+                model=self.azure_deployment_name, # 注意：這裡是你在 Azure 上的「部署名稱」
+                max_tokens=1500,
+                messages=messages,
+                tools=available_tools,
+                tool_choice="auto",
+            )
 
-        # Process response and handle tool calls
-        final_text = []
+            response_message = response.choices[0].message
+            tool_calls = response_message.tool_calls
 
-        assistant_message_content = []
-        for content in response.content:
-            if content.type == 'text':
-                final_text.append(content.text)
-                assistant_message_content.append(content)
-            elif content.type == 'tool_use':
-                tool_name = content.name
-                tool_args = content.input
+            # 步驟 1: 檢查模型是否要求呼叫工具
+            if not tool_calls:
+                # 如果沒有工具要呼叫，直接返回模型的文字回覆
+                return response_message.content
 
-                # Execute tool call
-                result = await self.session.call_tool(tool_name, tool_args)
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
-
-                assistant_message_content.append(content)
-                messages.append({
-                    "role": "assistant",
-                    "content": assistant_message_content
+            # 步驟 2: 執行工具呼叫
+            # 先將 assistant 的回覆 (包含 tool_calls) 加入歷史紀錄
+            messages.append(response_message)
+            
+            # 平行處理所有工具呼叫
+            tool_results = []
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                # OpenAI 的參數是 JSON 字串，需要解析
+                function_args = json.loads(tool_call.function.arguments)
+                
+                print(f"...正在執行工具 '{function_name}'，參數: {function_args}...")
+                
+                # 呼叫 MCP Server 上的工具
+                result = await self.session.call_tool(function_name, function_args)
+                
+                # 將工具的執行結果準備好，以便回傳給模型
+                tool_results.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": function_name,
+                    "content": result.content, # 假設 result.content 是字串
                 })
-                messages.append({
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": content.id,
-                            "content": result.content
-                        }
-                    ]
-                })
 
-                # Get next response from Claude
-                response = self.anthropic.messages.create(
-                    model="claude-3-5-sonnet-20241022",
-                    max_tokens=1000,
-                    messages=messages,
-                    tools=available_tools
-                )
+            # 步驟 3: 將所有工具的執行結果加入歷史紀錄
+            messages.extend(tool_results)
 
-                final_text.append(response.content[0].text)
-
-        return "\n".join(final_text)
+            # 進入下一個循環，將帶有工具結果的 messages 再次發送給模型進行總結
+        # --- 修改結束 ---
 
     async def chat_loop(self):
-        """Run an interactive chat loop"""
-        print("\nMCP Client Started!")
-        print("Type your queries or 'quit' to exit.")
+        """運行互動式聊天循環"""
+        print("\nMCP 客戶端已啟動！")
+        print("請輸入您的查詢，或輸入 'quit' 退出。")
 
         while True:
             try:
-                query = input("\nQuery: ").strip()
+                query = input("\n查詢: ").strip()
 
                 if query.lower() == 'quit':
                     break
+                
+                if not query:
+                    continue
 
                 response = await self.process_query(query)
-                print("\n" + response)
+                print("\n模型回覆:\n" + response)
 
             except Exception as e:
-                print(f"\nError: {str(e)}")
+                print(f"\n發生錯誤: {str(e)}")
 
     async def cleanup(self):
-        """Clean up resources"""
+        """清理資源"""
         await self.exit_stack.aclose()
 
 async def main():
     if len(sys.argv) < 2:
-        print("Usage: python client.py <path_to_server_script>")
+        print("用法: python client.py <path_to_server_script>")
         sys.exit(1)
 
     client = MCPClient()
@@ -150,5 +167,4 @@ async def main():
         await client.cleanup()
 
 if __name__ == "__main__":
-    import sys
     asyncio.run(main())
