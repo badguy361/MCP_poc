@@ -5,37 +5,26 @@ import json
 from typing import Optional
 from contextlib import AsyncExitStack
 
-# 安裝必要的套件:
-# pip install mcp-client openai python-dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-# 改為從 openai 庫導入 AsyncAzureOpenAI
 from openai import AsyncAzureOpenAI
 from dotenv import load_dotenv
 
-# 從 .env 文件載入環境變數
 load_dotenv()
 
 class MCPClient:
     def __init__(self):
-        # 初始化 session 和 client 物件
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
-
-        # --- 修改開始: 初始化 Azure OpenAI Client ---
-        # 從環境變數讀取 Azure OpenAI 的設定
         self.azure_deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
         if not self.azure_deployment_name:
             raise ValueError("AZURE_OPENAI_DEPLOYMENT_NAME 環境變數未設定")
-
-        # 使用非同步的 Azure OpenAI Client
         self.openai_client = AsyncAzureOpenAI(
             api_key=os.getenv("AZURE_OPENAI_API_KEY"),
             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
             api_version=os.getenv("OPENAI_API_VERSION"),
         )
-        # --- 修改結束 ---
 
     async def load_server_config(self):
         self.server_config = {
@@ -111,12 +100,11 @@ class MCPClient:
             }
         } for tool in response.tools]
 
-        # --- 修改開始: 使用 Azure OpenAI API 進行 Tool-Calling ---
         while True:
             # 第一次 (或後續) API 呼叫
             print("...正在呼叫 Azure OpenAI...")
             response = await self.openai_client.chat.completions.create(
-                model=self.azure_deployment_name, # 注意：這裡是你在 Azure 上的「部署名稱」
+                model=self.azure_deployment_name,
                 max_tokens=1500,
                 messages=messages,
                 tools=available_tools,
